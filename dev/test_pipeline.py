@@ -15,7 +15,7 @@ import tempfile
 import struct
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from output import (
     make_texture_record, write_manifest, write_failures,
@@ -88,7 +88,10 @@ def test_manifest_schema():
         write_manifest(d, [rec], "test.3ds", "0004000000035D00", "RE_REV")
         with open(os.path.join(d, "manifest.json"), "r") as f:
             m = json.load(f)
-        assert m["schema_version"] == 2
+        assert m["schema_version"] == 4
+        assert "source" in m
+        assert "rebuild_compatibility" in m
+        assert "repack_capabilities" in m
         assert len(m["textures"]) == 1
         assert m["textures"][0]["id"] == "tex_0000"
         print("  PASSED")
@@ -142,10 +145,10 @@ def test_quality_metrics():
     assert qm["pct_transparent"] == 0.0
 
     # Solid color
-    solid = np.full((16, 16, 4), 128, dtype=np.uint8)
+    solid = np.full((32, 32, 4), 128, dtype=np.uint8)
     qm2 = compute_quality_metrics(solid)
     assert qm2["is_suspicious"], "Solid color should be suspicious"
-    assert "solid_color" in qm2["flags"]
+    assert "SUSPICIOUS_SOLID" in qm2["flags"]
 
     # Mostly transparent
     trans = np.zeros((16, 16, 4), dtype=np.uint8)

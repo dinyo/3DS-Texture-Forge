@@ -327,12 +327,12 @@ class DropZone(QFrame):
             painter.setFont(QFont(FONT_FAMILY, 14))
             painter.drawText(rect.adjusted(0, 85, 0, -40),
                              Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                             "Drop a ROM here or click to browse")
+                             "Drop a ROM/RomFS folder here or click to browse")
             painter.setPen(QColor(C_TEXT2))
             painter.setFont(QFont(FONT_FAMILY, 10))
             painter.drawText(rect.adjusted(0, 115, 0, -20),
                              Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                             "Supports .3ds and .cia (decrypted)")
+                             "Supports decrypted .3ds/.cia and extracted RomFS folders")
         painter.end()
 
     def mousePressEvent(self, event):
@@ -341,7 +341,8 @@ class DropZone(QFrame):
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.toLocalFile().lower().endswith((".3ds", ".cia", ".cxi", ".app")):
+                local_path = url.toLocalFile()
+                if os.path.isdir(local_path) or local_path.lower().endswith((".3ds", ".cia", ".cxi", ".app")):
                     event.acceptProposedAction()
                     self._hovering = True
                     self._update_style(True)
@@ -356,7 +357,7 @@ class DropZone(QFrame):
         self._update_style(False)
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".3ds", ".cia", ".cxi", ".app")):
+            if os.path.isdir(path) or path.lower().endswith((".3ds", ".cia", ".cxi", ".app")):
                 self.file_dropped.emit(path)
                 return
         if event.mimeData().urls():
@@ -1288,12 +1289,12 @@ class MainWindow(QMainWindow):
         if path == "":
             self._browse_input()
             return
-        if not path.lower().endswith((".3ds", ".cia", ".cxi", ".app")):
-            self._show_error("Not a 3DS ROM",
-                             "Supported formats: .3ds, .cia\nMake sure the file is decrypted.")
+        if not os.path.isdir(path) and not path.lower().endswith((".3ds", ".cia", ".cxi", ".app")):
+            self._show_error("Unsupported input",
+                             "Use a decrypted .3ds/.cia/.cxi/.app file or an extracted RomFS folder.")
             return
-        if not os.path.isfile(path):
-            self._show_error("File not found", f"Could not find: {path}")
+        if not os.path.isfile(path) and not os.path.isdir(path):
+            self._show_error("Input not found", f"Could not find: {path}")
             return
         self._load_file(path)
 
@@ -1303,6 +1304,10 @@ class MainWindow(QMainWindow):
             self, "Select 3DS ROM", start_dir,
             "3DS ROMs (*.3ds *.cia *.cxi *.app);;All Files (*)",
         )
+        if not path:
+            path = QFileDialog.getExistingDirectory(
+                self, "Select extracted RomFS folder", start_dir,
+            )
         if path:
             self._load_file(path)
 
@@ -1312,7 +1317,8 @@ class MainWindow(QMainWindow):
         self._hide_error()
         self.results_frame.setVisible(False)
         self.drop_zone.set_loaded(path, "Scanning...")
-        self.statusBar().showMessage(f"Scanning {os.path.basename(path)}...")
+        input_label = os.path.basename(os.path.normpath(path))
+        self.statusBar().showMessage(f"Scanning {input_label}...")
 
         result = scan_rom(path)
         if result["success"]:
@@ -1348,7 +1354,7 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════
 
     def _do_extract(self):
-        if not self._loaded_path or not os.path.isfile(self._loaded_path):
+        if not self._loaded_path or (not os.path.isfile(self._loaded_path) and not os.path.isdir(self._loaded_path)):
             return
         if not self._output_dir:
             return
@@ -1543,6 +1549,9 @@ class MainWindow(QMainWindow):
             tex_dir = src
         count = 0
         try:
+            pack_json = os.path.join(tex_dir, "pack.json")
+            if os.path.isfile(pack_json):
+                shutil.copy2(pack_json, os.path.join(az_path, "pack.json"))
             for f in os.listdir(tex_dir):
                 if f.lower().endswith(".png"):
                     shutil.copy2(os.path.join(tex_dir, f), os.path.join(az_path, f))
@@ -1586,7 +1595,7 @@ class MainWindow(QMainWindow):
         text.setStyleSheet(f"background: {C_SURFACE}; border: none; color: {C_TEXT};")
         text.setHtml(f"""
             <h2 style="color:{C_TEXT};">3DS Texture Forge v1.1</h2>
-            <p>Extract textures from decrypted Nintendo 3DS game ROMs.</p>
+            <p>Extract textures from decrypted Nintendo 3DS game ROMs and RomFS folders.</p>
             <p>Supports 40+ games with over 1.5 million textures.</p>
             <p>Features: quality reports, contact sheets, deduplication,
             Azahar/Citra custom texture pack output, batch extraction.</p>

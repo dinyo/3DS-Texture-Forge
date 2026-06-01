@@ -17,18 +17,11 @@ import hashlib
 import json
 import logging
 import os
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
-
-import numpy as np
-
-try:
-    import xxhash as _xxhash
-    _HAS_XXHASH = True
-except ImportError:
-    _HAS_XXHASH = False
 
 from parsers.ncsd import NCSDParser
 from parsers.cia import CIAParser
@@ -46,11 +39,14 @@ from output import (
     save_texture_as_png, generate_output_filename, build_output_path,
     save_raw_data, make_texture_record, write_manifest, write_failures,
     write_unknown_files, write_summary, sha1_bytes, sha1_rgba,
-    compute_dedup_stats,
+    compute_dedup_stats, make_alpha_visible,
 )
 from quality import compute_quality_metrics, generate_quality_report
 from contact_sheet import generate_contact_sheet
 from pack_builder import build_pack
+from romfs_builder import build_romfs_from_manifest
+from repack_capabilities import TEXTURE_WRITERS
+from cityhash64 import cityhash64_hex
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +133,337 @@ def parse_rom(input_path: str) -> Tuple[bytes, str, str, str]:
     logger.info(f"Title ID: {title_id_str}  Product: {product_code}")
     romfs_data = ncch.get_romfs()
     return romfs_data, title_id_str, product_code, chain
+
+
+class ArchiveRomFSSource:
+    """Uniform file source for a RomFS embedded in a ROM container."""
+
+    is_directory = False
+
+    def __init__(self, romfs_data: bytes):
+        self.romfs_data = romfs_data
+        self._romfs = RomFSParser(romfs_data)
+        self._files = self._romfs.list_files()
+
+    def list_files(self) -> List[Tuple[str, int, int]]:
+        return self._files
+
+    def read_file_by_index(self, index: int) -> Tuple[str, bytes]:
+        return self._romfs.read_file_by_index(index)
+
+    def peek_file_by_index(self, index: int, size: int = 0x30) -> bytes:
+        _path, offset, file_size = self._files[index]
+        if file_size <= 0 or offset <= 0:
+            return b""
+        return self.romfs_data[offset:offset + min(file_size, size)]
+
+
+class DirectoryRomFSSource:
+    """Uniform file source for an already-extracted RomFS directory."""
+
+    is_directory = True
+    romfs_data = b""
+
+    def __init__(self, root_path: str):
+        self.root_path = os.path.abspath(root_path)
+        self._files: List[Tuple[str, int, int]] = []
+        self._real_paths: List[str] = []
+        self._scan()
+
+    def _scan(self):
+        for root, dirs, files in os.walk(self.root_path):
+            dirs.sort()
+            for fname in sorted(files):
+                real_path = os.path.join(root, fname)
+                rel = os.path.relpath(real_path, self.root_path).replace("\\", "/")
+                romfs_path = "/" + rel.lstrip("/")
+                try:
+                    size = os.path.getsize(real_path)
+                except OSError:
+                    continue
+                self._real_paths.append(real_path)
+                self._files.append((romfs_path, 0, size))
+
+    def list_files(self) -> List[Tuple[str, int, int]]:
+        return self._files
+
+    def read_file_by_index(self, index: int) -> Tuple[str, bytes]:
+        path = self._files[index][0]
+        with open(self._real_paths[index], "rb") as f:
+            return path, f.read()
+
+    def peek_file_by_index(self, index: int, size: int = 0x30) -> bytes:
+        try:
+            with open(self._real_paths[index], "rb") as f:
+                return f.read(size)
+        except OSError:
+            return b""
+
+
+def load_input_source(input_path: str):
+    """
+    Load either a ROM container or an already-extracted RomFS directory.
+    Returns (source, title_id, product_code, container_chain).
+    """
+    if os.path.isdir(input_path):
+        logger.info(f"Scanning RomFS folder: {input_path}")
+        source = DirectoryRomFSSource(input_path)
+        return source, "ROMFS_FOLDER", "RomFS Folder", "RomFS directory"
+
+    romfs_data, title_id, product_code, chain = parse_rom(input_path)
+    return ArchiveRomFSSource(romfs_data), title_id, product_code, chain
+
+
+def input_size_mb(input_path: str) -> float:
+    if os.path.isdir(input_path):
+        total = 0
+        for root, _dirs, files in os.walk(input_path):
+            for fname in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fname))
+                except OSError:
+                    pass
+        return round(total / (1024 * 1024), 2)
+    return round(os.path.getsize(input_path) / (1024 * 1024), 2)
+
+
+def attach_rebuild_metadata(rec: Dict[str, Any], tex_info: Dict[str, Any],
+                            romfs_file_path: str,
+                            archive_context: Optional[Dict[str, Any]] = None):
+    source_texture_path = tex_info.get("source_file") or romfs_file_path
+    parent_path = romfs_file_path
+    inner_path = ""
+
+    if source_texture_path != romfs_file_path:
+        if source_texture_path.startswith(romfs_file_path):
+            inner_path = source_texture_path[len(romfs_file_path):].lstrip(">/")
+        elif ">" in source_texture_path:
+            parent_path, inner_path = source_texture_path.split(">", 1)
+        elif source_texture_path.startswith(romfs_file_path.rstrip("/") + "/"):
+            inner_path = source_texture_path[len(romfs_file_path.rstrip("/")) + 1:]
+
+    rec["source_texture_path"] = source_texture_path
+    rebuild = {
+        "parent": parent_path,
+        "inner_path": inner_path,
+        "is_archive_member": bool(inner_path),
+        "texture_name": tex_info.get("name", ""),
+        "texture_index": tex_info.get("index"),
+        "format_id": tex_info.get("format", 0),
+        "container_format": tex_info.get("bflim_format"),
+        "data_offset": tex_info.get("data_offset", 0),
+        "data_size": tex_info.get("data_size", len(tex_info.get("data", b""))),
+        "parser_used": tex_info.get("parser_used", "unknown"),
+    }
+    display_width = tex_info.get("display_width") or tex_info.get("crop_width")
+    display_height = tex_info.get("display_height") or tex_info.get("crop_height")
+    if display_width and display_height:
+        rebuild["display_width"] = int(display_width)
+        rebuild["display_height"] = int(display_height)
+    if inner_path and archive_context:
+        rebuild["archive_context"] = _compact_archive_context(archive_context)
+        layout_constraints = _layout_constraints_for_inner_path(archive_context, inner_path)
+        if layout_constraints:
+            rebuild["layout_constraints"] = layout_constraints
+            rebuild["layout_constraint_status"] = _layout_constraint_status(
+                rec.get("width", 0), rec.get("height", 0), layout_constraints
+            )
+        else:
+            rebuild["layout_constraint_status"] = "unknown_or_runtime"
+        rebuild["simple_png_replace_safe"] = not bool(archive_context.get("risk_flags"))
+    rec["rebuild"] = rebuild
+
+
+def _compact_archive_context(archive_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep per-record manifest context small while preserving safety signals."""
+    compact = dict(archive_context)
+    compact.pop("texture_canvases", None)
+    return compact
+
+
+def build_archive_rebuild_context(file_data: bytes, file_path: str,
+                                  textures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not any((t.get("source_file") or file_path) != file_path for t in textures):
+        return None
+
+    entries = _archive_entries(file_data)
+    if not entries:
+        return None
+    names = [name for name, _blob in entries]
+
+    ext_counts: Dict[str, int] = {}
+    for name in names:
+        ext = path_ext(name)
+        if ext:
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
+    bclan_animation_types = _archive_bclan_animation_types(entries)
+    risk_flags = []
+    if "CLTS" in bclan_animation_types:
+        risk_flags.append("texture_srt_animation:bclan")
+    if "CLTP" in bclan_animation_types:
+        risk_flags.append("texture_pattern_animation:bclan")
+    if ext_counts.get("bclan") and not bclan_animation_types:
+        risk_flags.append("unknown_layout_animation:bclan")
+    if ext_counts.get("bcmata"):
+        risk_flags.append("material_animation:bcmata")
+    if ext_counts.get("bcmdl") or ext_counts.get("bch") or ext_counts.get("cgfx"):
+        risk_flags.append("model_or_graphics_container")
+    if ext_counts.get("bcskla") or ext_counts.get("bcma") or ext_counts.get("bcanm"):
+        risk_flags.append("animation_container")
+    if ext_counts.get("bcfnt"):
+        risk_flags.append("font_sibling")
+
+    companion_exts = sorted(
+        ext for ext in ext_counts
+        if ext not in {"bclim", "bflim", "png", "bin"}
+    )
+    texture_canvases = _archive_texture_canvases(entries)
+    return {
+        "archive_member_count": len(names),
+        "companion_extensions": companion_exts,
+        "companion_counts": {ext: ext_counts[ext] for ext in companion_exts},
+        "has_bclan": bool(ext_counts.get("bclan")),
+        "has_bclyt": bool(ext_counts.get("bclyt")),
+        "bclan_animation_types": bclan_animation_types,
+        "texture_canvas_count": len(texture_canvases),
+        "texture_canvases": texture_canvases,
+        "risk_flags": risk_flags,
+        "risk_level": "high" if any("texture_" in flag or flag.startswith("unknown_") for flag in risk_flags)
+        else ("medium" if risk_flags else "low"),
+    }
+
+
+def _layout_constraints_for_inner_path(archive_context: Dict[str, Any], inner_path: str) -> List[Dict[str, Any]]:
+    key = _texture_key(inner_path)
+    canvases = archive_context.get("texture_canvases", {})
+    return list(canvases.get(key, [])) if isinstance(canvases, dict) else []
+
+
+def _layout_constraint_status(width: int, height: int, constraints: List[Dict[str, Any]]) -> str:
+    if not constraints:
+        return "unknown_or_runtime"
+    for c in constraints:
+        cw = c.get("canvas_width", 0)
+        ch = c.get("canvas_height", 0)
+        if cw and ch and (abs(float(cw) - float(width)) > 0.5 or abs(float(ch) - float(height)) > 0.5):
+            return "explicit_canvas_differs_from_texture"
+    return "explicit_canvas_matches_texture"
+
+
+def _texture_key(path: str) -> str:
+    base = os.path.basename(str(path).replace("\\", "/")).lower()
+    if base.endswith(".bclim"):
+        base = base[:-6]
+    if base.endswith(".bflim"):
+        base = base[:-6]
+    return base
+
+
+def _archive_texture_canvases(entries: List[Tuple[str, bytes]]) -> Dict[str, List[Dict[str, Any]]]:
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        from layout_analyzer import analyze_bclyt_texture_canvases, is_bclyt
+        for name, blob in entries:
+            if not is_bclyt(blob):
+                continue
+            canvases = analyze_bclyt_texture_canvases(blob, layout_name=name)
+            for tex_key, pane_infos in canvases.items():
+                result.setdefault(tex_key, []).extend(pane_infos)
+    except Exception:
+        return result
+    return result
+
+
+def _archive_bclan_animation_types(entries: List[Tuple[str, bytes]]) -> List[str]:
+    found = set()
+    try:
+        from layout_analyzer import analyze_bclan_animation_types, is_bclan
+        for _name, blob in entries:
+            if is_bclan(blob):
+                found.update(analyze_bclan_animation_types(blob))
+    except Exception:
+        return []
+    return sorted(found)
+
+
+def _archive_entries(data: bytes) -> List[Tuple[str, bytes]]:
+    if len(data) < 4:
+        return []
+    if data[:4] == b"darc" and data[4:6] == b"\xff\xfe":
+        from parsers.darc import parse_darc
+        return list(parse_darc(data))
+    try:
+        if data[:4] == b"SARC":
+            from parsers.sarc import parse_sarc
+            return parse_sarc(data)
+        if data[:4] == b"NARC":
+            from parsers.narc import parse_narc
+            return parse_narc(data)
+        if data[:4] == b"ZAR\x01":
+            from parsers.zar import parse_zar
+            return parse_zar(data)
+        if data[:4] == b"CRAG":
+            from parsers.garc import parse_garc
+            return parse_garc(data)
+    except Exception:
+        return []
+    return []
+
+
+def _texture_skipped_by_rebuild_safety_filter(
+    tex_info: Dict[str, Any],
+    file_path: str,
+    archive_context: Optional[Dict[str, Any]],
+    skip_unsafe_simple_replace: bool = False,
+    skip_no_canvas_constraint: bool = False,
+) -> bool:
+    source_texture_path = tex_info.get("source_file") or file_path
+    if source_texture_path == file_path:
+        return skip_no_canvas_constraint
+
+    if skip_unsafe_simple_replace and archive_context:
+        if archive_context.get("risk_flags"):
+            return True
+
+    if skip_no_canvas_constraint:
+        if not archive_context:
+            return True
+        constraints = _layout_constraints_for_inner_path(
+            archive_context,
+            _inner_path_from_source(source_texture_path, file_path),
+        )
+        if not constraints:
+            return True
+
+    return False
+
+
+def _inner_path_from_source(source_texture_path: str, parent_file_path: str) -> str:
+    if source_texture_path.startswith(parent_file_path):
+        return source_texture_path[len(parent_file_path):].lstrip(">/")
+    if ">" in source_texture_path:
+        return source_texture_path.split(">", 1)[1]
+    if source_texture_path.startswith(parent_file_path.rstrip("/") + "/"):
+        return source_texture_path[len(parent_file_path.rstrip("/")) + 1:]
+    return source_texture_path
+
+
+def normalize_ext_filter(values) -> set:
+    result = set()
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip().lower().lstrip(".")
+            if part:
+                result.add(part)
+    return result
+
+
+def path_ext(path: str) -> str:
+    clean = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in clean:
+        return ""
+    return clean.rsplit(".", 1)[-1].lower()
 
 
 # Extensions that NEVER contain textures — skip immediately before any I/O.
@@ -226,28 +553,24 @@ def cmd_scan(args):
     setup_logging(args.verbose, args.quiet)
     t0 = time.time()
 
-    romfs_data, title_id, product_code, chain = parse_rom(args.input)
-
-    logger.info("Parsing RomFS filesystem...")
-    romfs = RomFSParser(romfs_data)
-    files = romfs.list_files()
+    source, title_id, product_code, chain = load_input_source(args.input)
+    files = source.list_files()
 
     type_counts: Dict[str, int] = {}
     ext_counts: Dict[str, int] = {}
     tex_file_candidates = 0
 
-    for path, offset, size in files:
+    for file_idx, (path, offset, size) in enumerate(files):
         ext = ""
         if "." in path:
             ext = "." + path.rsplit(".", 1)[-1].lower()
         ext_counts[ext] = ext_counts.get(ext, 0) + 1
 
-        if should_process_file(path, args.scan_all):
+        peek_data = source.peek_file_by_index(file_idx, 0x30)
+        if should_process_file(path, args.scan_all, file_data=peek_data):
             tex_file_candidates += 1
             # Quick fingerprint
-            _, fdata = romfs.read_file_by_index(
-                next(i for i, (p, _, _) in enumerate(files) if p == path)
-            )
+            _, fdata = source.read_file_by_index(file_idx)
             fp = fingerprint_file(fdata, path)
             t = fp.detected_type or "unknown"
             type_counts[t] = type_counts.get(t, 0) + 1
@@ -274,6 +597,27 @@ def cmd_scan(args):
 # EXTRACT subcommand
 # ──────────────────────────────────────────────
 
+def write_azahar_pack_config(output_dir: str) -> None:
+    """Write the pack config that tells Azahar to use the new hash format."""
+    pack_json = os.path.join(output_dir, "pack.json")
+    if os.path.exists(pack_json):
+        return
+
+    config = {
+        "author": "3DS Texture Forge",
+        "version": "1.0.0",
+        "description": "Generated texture pack",
+        "options": {
+            "skip_mipmap": False,
+            "flip_png_files": True,
+            "use_new_hash": True,
+        },
+        "textures": {},
+    }
+    with open(pack_json, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
 def cmd_extract(args, progress_callback=None):
     _verbose = getattr(args, 'verbose', False)
     _quiet = getattr(args, 'quiet', False)
@@ -287,11 +631,9 @@ def cmd_extract(args, progress_callback=None):
     _png_pool = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
     _png_futures = []  # collect futures to detect late failures
 
-    romfs_data, title_id, product_code, chain = parse_rom(args.input)
-
-    logger.info("Parsing RomFS filesystem...")
-    romfs = RomFSParser(romfs_data)
-    files = romfs.list_files()
+    source, title_id, product_code, chain = load_input_source(args.input)
+    romfs_data = source.romfs_data
+    files = source.list_files()
 
     azahar_mode = getattr(args, 'output_mode', 'normal') == 'azahar'
     if azahar_mode:
@@ -300,6 +642,8 @@ def cmd_extract(args, progress_callback=None):
     else:
         output_dir = args.output or os.path.join("output", title_id)
     os.makedirs(output_dir, exist_ok=True)
+    if azahar_mode:
+        write_azahar_pack_config(output_dir)
     logger.info(f"Output: {output_dir}" + (" [azahar mode]" if azahar_mode else ""))
 
     if args.list_files:
@@ -318,12 +662,15 @@ def cmd_extract(args, progress_callback=None):
     # Pre-pass: Smash Bros. 3DS dt/ls pair — inject virtual .bch entries
     _smash_virtual_params: Dict[int, tuple] = {}  # file_idx -> (dt_off, comp_sz)
     _smash_dt_rom_off: int = 0
-    _ls_entry = next(
-        ((p, o, s) for p, o, s in files if p.lower().lstrip("/") == "ls"), None
-    )
-    _dt_entry = next(
-        ((p, o, s) for p, o, s in files if p.lower().lstrip("/") == "dt"), None
-    )
+    _ls_entry = None
+    _dt_entry = None
+    if not source.is_directory:
+        _ls_entry = next(
+            ((p, o, s) for p, o, s in files if p.lower().lstrip("/") == "ls"), None
+        )
+        _dt_entry = next(
+            ((p, o, s) for p, o, s in files if p.lower().lstrip("/") == "dt"), None
+        )
     if _ls_entry and _dt_entry:
         _ls_raw = romfs_data[_ls_entry[1] : _ls_entry[1] + _ls_entry[2]]
         from parsers.smash_dt import (
@@ -391,6 +738,11 @@ def cmd_extract(args, progress_callback=None):
     failures: List[Dict[str, Any]] = []
     unknowns: List[Dict[str, Any]] = []
     tex_reports: List[Dict[str, Any]] = []  # RE:Revelations TEX report
+    only_archive_exts = normalize_ext_filter(getattr(args, "only_archive", []))
+    only_texture_exts = normalize_ext_filter(getattr(args, "only_texture", []))
+    only_supported_writers = getattr(args, "only_supported_writers", False)
+    skip_unsafe_simple_replace = getattr(args, "skip_unsafe_simple_replace", False)
+    skip_no_canvas_constraint = getattr(args, "skip_no_canvas_constraint", False)
 
     # Stats
     files_scanned = 0
@@ -403,7 +755,7 @@ def cmd_extract(args, progress_callback=None):
     # Dedup: md5(rgba_bytes) -> tex_id of first occurrence
     seen_content_hashes: Dict[str, str] = {}
     dedup_active = getattr(args, 'dedup', False)
-    # Raw-hash dedup: xxh64(raw_pixel_bytes) -> (tex_id, content_hash) of first occurrence
+    # Raw-hash dedup: CityHash64(raw_pixel_bytes) -> (tex_id, content_hash) of first occurrence
     # Allows skipping decode entirely when pixel data is identical
     seen_raw_hashes: Dict[str, tuple] = {}
 
@@ -411,7 +763,7 @@ def cmd_extract(args, progress_callback=None):
         # Quick reject by extension first, then peek magic for unknown extensions
         if not should_process_file(file_path, args.scan_all):
             # Extension not in skip or process list (or extensionless) — peek magic
-            _peek_data = romfs_data[file_offset:file_offset + min(file_size, 0x30)] if file_size > 0 and file_offset > 0 else b""
+            _peek_data = source.peek_file_by_index(file_idx, 0x30)
             if not should_process_file(file_path, args.scan_all, file_data=_peek_data):
                 continue
 
@@ -423,8 +775,8 @@ def cmd_extract(args, progress_callback=None):
         # This avoids expensive ROM reads for game-data files (Wwise audio, etc.).
         # BG4\x00 is intentionally NOT skipped — BG4 files embed BCH textures.
         _SKIP_MAGICS = {b"BKHD", b"AKPK", b"CSAR", b"NUS3", b"RIFF"}
-        if file_idx not in _smash_virtual_params and file_size > 0 and file_offset > 0:
-            _peek = romfs_data[file_offset : file_offset + 4]
+        if file_idx not in _smash_virtual_params and file_size > 0:
+            _peek = source.peek_file_by_index(file_idx, 4)
             if _peek in _SKIP_MAGICS:
                 unknown_types += 1
                 unknowns.append({"path": file_path, "detected_type": None,
@@ -443,7 +795,7 @@ def cmd_extract(args, progress_callback=None):
                 continue
         else:
             try:
-                _, file_data = romfs.read_file_by_index(file_idx)
+                _, file_data = source.read_file_by_index(file_idx)
             except Exception as e:
                 logger.warning(f"Cannot read {file_path}: {e}")
                 continue
@@ -473,7 +825,7 @@ def cmd_extract(args, progress_callback=None):
                     bin_idx = _texturebin_map.get(bin_key)
                     if bin_idx is not None:
                         try:
-                            _, bin_data = romfs.read_file_by_index(bin_idx)
+                            _, bin_data = source.read_file_by_index(bin_idx)
                             textures = _parse_gdb1(file_data, bin_data, file_path)
                         except Exception as _ge:
                             logger.warning(f"GDB1 pair read failed for {file_path}: {_ge}")
@@ -509,8 +861,41 @@ def cmd_extract(args, progress_callback=None):
             decoded_fail += 1
             continue
 
+        archive_rebuild_context = build_archive_rebuild_context(file_data, file_path, textures)
+
         for tex_info in textures:
           try:
+            source_texture_path = tex_info.get("source_file") or file_path
+            archive_parent_path = file_path
+            if source_texture_path != file_path:
+                if source_texture_path.startswith(file_path):
+                    archive_parent_path = file_path
+                elif ">" in source_texture_path:
+                    archive_parent_path = source_texture_path.split(">", 1)[0]
+            if only_archive_exts:
+                candidate_ext = path_ext(archive_parent_path)
+                if candidate_ext not in only_archive_exts:
+                    continue
+            if only_texture_exts:
+                candidate_ext = path_ext(source_texture_path)
+                if candidate_ext not in only_texture_exts:
+                    continue
+            if only_supported_writers:
+                parser_base = str(tex_info.get("parser_used", "unknown")).split("/", 1)[0].split("@", 1)[0]
+                if parser_base not in TEXTURE_WRITERS:
+                    continue
+            if (
+                skip_unsafe_simple_replace
+                or skip_no_canvas_constraint
+            ) and _texture_skipped_by_rebuild_safety_filter(
+                tex_info,
+                file_path,
+                archive_rebuild_context,
+                skip_unsafe_simple_replace=skip_unsafe_simple_replace,
+                skip_no_canvas_constraint=skip_no_canvas_constraint,
+            ):
+                continue
+
             fmt = tex_info.get("format", 0)
             w = tex_info.get("width", 0)
             h = tex_info.get("height", 0)
@@ -537,8 +922,8 @@ def cmd_extract(args, progress_callback=None):
 
             # Phase 4a: In --dedup mode, skip decode entirely if raw pixel bytes
             # are identical to a previously decoded texture (same bytes → same output).
-            if dedup_active and _HAS_XXHASH and pixel_data:
-                raw_hash_key = _xxhash.xxh64(pixel_data).hexdigest().upper()
+            if dedup_active and pixel_data:
+                raw_hash_key = cityhash64_hex(pixel_data)
                 if raw_hash_key in seen_raw_hashes:
                     first_tex_id, first_content_hash = seen_raw_hashes[raw_hash_key]
                     decoded_ok += 1
@@ -566,7 +951,8 @@ def cmd_extract(args, progress_callback=None):
                     )
                     rec["content_hash"] = first_content_hash
                     rec["duplicate_of"] = first_tex_id
-                    rec["raw_data_hash_xxh64"] = raw_hash_key
+                    rec["raw_data_hash_city64"] = raw_hash_key
+                    attach_rebuild_metadata(rec, tex_info, file_path, archive_rebuild_context)
                     records.append(rec)
                     tex_global_idx += 1
                     continue
@@ -610,6 +996,8 @@ def cmd_extract(args, progress_callback=None):
             # - Solid-color textures (1 unique color) are always garbage
             # - Two-color textures from the fallback scanner are also garbage
             if parser_used == "bch":
+                import numpy as np
+
                 flat = rgba.reshape(-1, 4)
                 n_sample = min(2000, len(flat))
                 sample = flat[:n_sample]
@@ -648,10 +1036,10 @@ def cmd_extract(args, progress_callback=None):
                       "flags": []}
 
             # Save PNG (skip if dedup mode and this is a duplicate)
-            if azahar_mode and _HAS_XXHASH and pixel_data:
-                # Azahar filename: tex1_<W>x<H>_<xxhash>_<fmt_int>.png
-                _xxh = _xxhash.xxh64(pixel_data).hexdigest().upper()
-                fname = f"tex1_{w}x{h}_{_xxh}_{fmt}.png"
+            if azahar_mode and pixel_data:
+                # Azahar filename: tex1_<W>x<H>_<CityHash64>_<fmt_int>_mip<N>.png
+                _city_hash = cityhash64_hex(pixel_data)
+                fname = f"tex1_{w}x{h}_{_city_hash}_{fmt}_mip0.png"
                 out_path = os.path.join(output_dir, fname)
             else:
                 fname = generate_output_filename(tex_global_idx, tex_info, file_path)
@@ -681,8 +1069,9 @@ def cmd_extract(args, progress_callback=None):
                 )
                 rec["content_hash"] = content_hash
                 rec["duplicate_of"] = duplicate_of
-                if _HAS_XXHASH and pixel_data:
-                    rec["raw_data_hash_xxh64"] = _xxhash.xxh64(pixel_data).hexdigest().upper()
+                if pixel_data:
+                    rec["raw_data_hash_city64"] = cityhash64_hex(pixel_data)
+                attach_rebuild_metadata(rec, tex_info, file_path, archive_rebuild_context)
                 records.append(rec)
                 tex_global_idx += 1
                 continue
@@ -722,13 +1111,15 @@ def cmd_extract(args, progress_callback=None):
                 quality_metrics=qm,
             )
             rec["content_hash"] = content_hash
-            if _HAS_XXHASH and pixel_data:
+            rec["sha1_png_rgba"] = sha1_rgba(make_alpha_visible(rgba.copy(), fmt))
+            if pixel_data:
                 if raw_hash_key is None:
-                    raw_hash_key = _xxhash.xxh64(pixel_data).hexdigest().upper()
-                rec["raw_data_hash_xxh64"] = raw_hash_key
+                    raw_hash_key = cityhash64_hex(pixel_data)
+                rec["raw_data_hash_city64"] = raw_hash_key
                 # Register for future raw-hash dedup (first saved occurrence)
                 if dedup_active and raw_hash_key not in seen_raw_hashes:
                     seen_raw_hashes[raw_hash_key] = (tex_id, content_hash)
+            attach_rebuild_metadata(rec, tex_info, file_path, archive_rebuild_context)
             records.append(rec)
             tex_global_idx += 1
           except Exception as _tex_exc:
@@ -827,7 +1218,7 @@ def cmd_extract(args, progress_callback=None):
         report_data = {
             "tool_version": "3.0",
             "rom_filename": rom_basename,
-            "rom_size_mb": round(os.path.getsize(args.input) / (1024 * 1024), 2),
+            "rom_size_mb": input_size_mb(args.input),
             "title_id": title_id,
             "product_code": product_code,
             "extraction_time_seconds": round(elapsed, 2),
@@ -993,6 +1384,104 @@ def cmd_build_pack(args):
 # IMPORT-DUMP subcommand
 # ──────────────────────────────────────────────
 
+def cmd_build_romfs(args):
+    setup_logging(args.verbose, args.quiet)
+    bar_width = 30
+    last_print = [0.0]
+    start_time = time.time()
+
+    def _progress(cur, total, rec, status, target):
+        if getattr(args, "quiet", False):
+            return
+        now = time.time()
+        if now - last_print[0] < 0.10 and cur < total and status == "processing":
+            return
+        last_print[0] = now
+        pct = cur / total if total else 1.0
+        filled = int(bar_width * pct)
+        bar = "=" * filled + "-" * (bar_width - filled)
+        elapsed = now - start_time
+        eta = ""
+        if pct > 0.01 and elapsed > 1 and cur < total:
+            remaining = elapsed / pct * (1 - pct)
+            m, s = divmod(int(remaining), 60)
+            eta = f" | ETA: {m}:{s:02d}"
+        short_target = (target or rec.get("source_file_path", "") or rec.get("id", "")).replace("\\", "/")
+        if len(short_target) > 52:
+            short_target = "..." + short_target[-49:]
+        line = (
+            f"\r  [{bar}] {pct*100:4.0f}% | "
+            f"{cur}/{total} | {status:22s} | {short_target}{eta}   "
+        )
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        if cur == total and status != "processing":
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    report = build_romfs_from_manifest(
+        args.manifest,
+        args.output_folder,
+        source_romfs_folder=getattr(args, "source_romfs", ""),
+        overwrite=getattr(args, "overwrite", False),
+        progress_callback=_progress,
+        only_archive_exts=getattr(args, "only_archive", []),
+        only_texture_exts=getattr(args, "only_texture", []),
+        only_supported_writers=getattr(args, "only_supported_writers", False),
+        full_copy=getattr(args, "full_copy", False),
+        allow_etc_transcode=not getattr(args, "no_etc_transcode", False),
+        include_parent_patterns=getattr(args, "include_parent", []),
+        exclude_parent_patterns=getattr(args, "exclude_parent", []),
+        max_replacement_width=getattr(args, "max_replacement_width", 0),
+        max_replacement_height=getattr(args, "max_replacement_height", 0),
+        max_scale=getattr(args, "max_scale", 0.0),
+        max_texture_bytes=getattr(args, "max_texture_bytes", 0),
+        etc_quality=getattr(args, "etc_quality", "fast"),
+        skip_unsafe_simple_replace=getattr(args, "skip_unsafe_simple_replace", False),
+        skip_no_canvas_constraint=getattr(args, "skip_no_canvas_constraint", False),
+        preserve_logical_size=not getattr(args, "no_preserve_logical_size", False),
+        layout_aware_repack=not getattr(args, "no_layout_aware_repack", False),
+        rebuild_all=getattr(args, "rebuild_all", False),
+    )
+
+    print(f"\nBuilt RomFS package: {report['output_folder']}")
+    print(f"RomFS folder: {report['romfs_folder']}")
+    print(f"Copied source RomFS: {report['source_romfs_folder']}")
+    print(f"Copy mode: {report['copy_mode']} ({report['copied_files_count']} files)")
+    print(f"Texture records: {report['texture_records']}")
+    print(f"Replacement PNGs found: {report['planned_replacements']}")
+    print(f"Applied replacements: {report['applied_replacements']}")
+    print(f"Unchanged PNGs skipped: {report.get('unchanged_replacements_count', 0)}")
+    print(f"Skipped by filters: {report.get('skipped_by_filter_count', 0)}")
+    print(f"Failed replacements: {report['failed_replacements']}")
+    print(f"Unsupported replacements: {report['unsupported_replacements_count']}")
+    print(f"Missing replacements: {report['missing_replacements_count']}")
+    size_summary = report.get("size_summary") or {}
+    if size_summary:
+        source_mb = size_summary.get("source_bytes", 0) / (1024 * 1024)
+        output_mb = size_summary.get("output_bytes", 0) / (1024 * 1024)
+        ratio = size_summary.get("growth_ratio")
+        ratio_text = f"{ratio:.2f}x" if ratio is not None else "n/a"
+        print(f"Output size: {output_mb:.1f} MB from {source_mb:.1f} MB ({ratio_text})")
+    timings = report.get("timings_seconds") or {}
+    if timings:
+        print(
+            "Timings: "
+            f"filter {timings.get('manifest_filter', 0):.1f}s, "
+            f"plan {timings.get('replacement_planning', 0):.1f}s, "
+            f"copy {timings.get('source_copy', 0):.1f}s, "
+            f"rebuild {timings.get('rebuild', 0):.1f}s, "
+            f"size {timings.get('size_summary', 0):.1f}s, "
+            f"total {timings.get('total', 0):.1f}s"
+        )
+    print(f"Report: {report['report_path']}")
+    if report["unsupported_replacements"]:
+        print(
+            "\nNOTE: The output RomFS is a safe copy. Archive/container reinjection "
+            "is reported but not yet written."
+        )
+
+
 def cmd_import_dump(args):
     setup_logging(args.verbose, args.quiet)
     dump_folder = args.dump_folder
@@ -1135,20 +1624,20 @@ def _parse_dump_filename(fname: str) -> Dict[str, Any]:
 def build_parser():
     top = argparse.ArgumentParser(
         prog="3ds-tex-extract",
-        description="Extract textures from 3DS ROMs for Azahar/Citra texture packs.",
+        description="Extract textures from 3DS ROMs or extracted RomFS folders for Azahar/Citra texture packs.",
     )
     sub = top.add_subparsers(dest="command")
 
     # --- scan ---
-    p_scan = sub.add_parser("scan", help="Scan a ROM and report contents")
-    p_scan.add_argument("input", help="Path to ROM file")
+    p_scan = sub.add_parser("scan", help="Scan a ROM/RomFS folder and report contents")
+    p_scan.add_argument("input", help="Path to ROM file or extracted RomFS folder")
     p_scan.add_argument("--scan-all", action="store_true")
     p_scan.add_argument("--verbose", action="store_true")
     p_scan.add_argument("--quiet", action="store_true")
 
     # --- extract ---
     p_ext = sub.add_parser("extract", help="Extract textures to PNG")
-    p_ext.add_argument("input", help="Path to ROM file")
+    p_ext.add_argument("input", help="Path to ROM file or extracted RomFS folder")
     p_ext.add_argument("-o", "--output", metavar="DIR")
     p_ext.add_argument("--scan-all", action="store_true")
     p_ext.add_argument("--dump-raw", action="store_true")
@@ -1159,6 +1648,16 @@ def build_parser():
                        help="Write a machine-readable report.json to the output directory")
     p_ext.add_argument("--output-mode", choices=["normal", "azahar"], default="normal",
                        help="Output mode: 'normal' (default) or 'azahar' (Azahar/Citra texture pack layout)")
+    p_ext.add_argument("--only-archive", action="append", default=[],
+                       help="Only keep textures from parent files with this extension (repeatable or comma-separated, e.g. arc)")
+    p_ext.add_argument("--only-texture", action="append", default=[],
+                       help="Only keep textures whose texture/source extension matches (repeatable or comma-separated, e.g. bclim)")
+    p_ext.add_argument("--only-supported-writers", action="store_true",
+                       help="Only keep textures that have a supported build-romfs texture writer")
+    p_ext.add_argument("--skip-unsafe-simple-replace", action="store_true",
+                       help="Skip textures flagged unsafe for simple PNG/BCLIM replacement")
+    p_ext.add_argument("--skip-no-canvas-constraint", action="store_true",
+                       help="Skip textures without an explicit BCLYT pane canvas constraint")
     p_ext.add_argument("--verbose", action="store_true")
     p_ext.add_argument("--quiet", action="store_true")
 
@@ -1173,6 +1672,51 @@ def build_parser():
     p_pack.add_argument("project_dir", help="Extraction output directory")
     p_pack.add_argument("--verbose", action="store_true")
     p_pack.add_argument("--quiet", action="store_true")
+
+    # --- build-romfs ---
+    p_romfs = sub.add_parser("build-romfs", help="Build a mod RomFS folder from manifest.json")
+    p_romfs.add_argument("manifest", help="Path to extraction manifest.json")
+    p_romfs.add_argument("output_folder", help="New output RomFS folder")
+    p_romfs.add_argument("--source-romfs", default="",
+                         help="Override source RomFS folder if manifest does not contain source.source_romfs_folder")
+    p_romfs.add_argument("--overwrite", action="store_true",
+                         help="Delete and recreate output folder if it already exists")
+    p_romfs.add_argument("--only-archive", action="append", default=[],
+                         help="Only rebuild textures from parent files with this extension (repeatable or comma-separated, e.g. arc)")
+    p_romfs.add_argument("--only-texture", action="append", default=[],
+                         help="Only rebuild textures whose texture/source extension matches (repeatable or comma-separated, e.g. bclim)")
+    p_romfs.add_argument("--only-supported-writers", action="store_true",
+                         help="Only rebuild textures that have a supported texture writer")
+    p_romfs.add_argument("--full-copy", action="store_true",
+                         help="Copy the entire source RomFS instead of only files referenced by the manifest/filter")
+    p_romfs.add_argument("--no-etc-transcode", action="store_true",
+                         help="Legacy compatibility option; ETC1/ETC1A4 are now encoded instead of transcoded")
+    p_romfs.add_argument("--include-parent", action="append", default=[],
+                         help="Only rebuild parent paths matching this glob/substr (repeatable or comma-separated)")
+    p_romfs.add_argument("--exclude-parent", action="append", default=[],
+                         help="Skip parent paths matching this glob/substr (repeatable or comma-separated)")
+    p_romfs.add_argument("--max-replacement-width", type=int, default=0,
+                         help="Skip replacement PNGs wider than this many pixels")
+    p_romfs.add_argument("--max-replacement-height", type=int, default=0,
+                         help="Skip replacement PNGs taller than this many pixels")
+    p_romfs.add_argument("--max-scale", type=float, default=0.0,
+                         help="Skip replacement PNGs scaled above this factor versus the original")
+    p_romfs.add_argument("--max-texture-bytes", type=int, default=0,
+                         help="Skip replacements whose estimated encoded texture payload exceeds this byte count")
+    p_romfs.add_argument("--etc-quality", choices=("fast", "high"), default="fast",
+                         help="ETC1/ETC1A4 encoder mode; fast is much quicker, high searches more")
+    p_romfs.add_argument("--skip-unsafe-simple-replace", action="store_true",
+                         help="Skip records flagged unsafe for simple PNG/BCLIM replacement")
+    p_romfs.add_argument("--skip-no-canvas-constraint", action="store_true",
+                         help="Skip records without an explicit BCLYT pane canvas constraint")
+    p_romfs.add_argument("--no-preserve-logical-size", action="store_true",
+                         help="Write BCLIM/BFLIM display size from replacement PNG instead of preserving original size")
+    p_romfs.add_argument("--no-layout-aware-repack", action="store_true",
+                         help="Disable BCLYT-aware HD BCLIM sizing for archives with readable layout canvases")
+    p_romfs.add_argument("--rebuild-all", action="store_true",
+                         help="Re-encode every manifest PNG, including files unchanged since extraction")
+    p_romfs.add_argument("--verbose", action="store_true")
+    p_romfs.add_argument("--quiet", action="store_true")
 
     # --- import-dump ---
     p_imp = sub.add_parser("import-dump", help="Import emulator texture dump")
@@ -1192,7 +1736,7 @@ def main():
         # Backward compat: treat first positional as ROM, run extract
         if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
             maybe_rom = sys.argv[1]
-            if os.path.isfile(maybe_rom):
+            if os.path.isfile(maybe_rom) or os.path.isdir(maybe_rom):
                 sys.argv.insert(1, "extract")
                 args = parser.parse_args()
             else:
@@ -1207,6 +1751,7 @@ def main():
         "extract": cmd_extract,
         "report": cmd_report,
         "build-pack": cmd_build_pack,
+        "build-romfs": cmd_build_romfs,
         "import-dump": cmd_import_dump,
     }
 

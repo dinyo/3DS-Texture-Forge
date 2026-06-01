@@ -50,6 +50,15 @@ def build_pack(
         "schema_version": 1,
         "title_id": title_id,
         "pack_mode": mode,
+        "author": "3DS Texture Forge",
+        "version": "1.0.0",
+        "description": "Generated texture pack",
+        "options": {
+            "skip_mipmap": False,
+            "flip_png_files": True,
+            "use_new_hash": True,
+        },
+        "textures": {},
         "texture_count": 0,
         "mapped_count": 0,
         "unmapped_count": 0,
@@ -79,6 +88,7 @@ def build_pack(
             dest_path = os.path.join(pack_dir, dest_name)
             try:
                 shutil.copy2(png_abs, dest_path)
+                pack_meta["textures"][dump_hash] = dest_name
                 pack_meta["mappings"][dump_hash] = {
                     "source_id": tex_id,
                     "source_file": tex.get("source_file_path", ""),

@@ -14,8 +14,7 @@ import traceback
 from types import SimpleNamespace
 from typing import Callable, Dict, Any, List, Optional
 
-from main import parse_rom, cmd_extract, EncryptedROMError, ROMParseError
-from parsers.romfs import RomFSParser
+from main import load_input_source, cmd_extract, EncryptedROMError, ROMParseError
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +47,9 @@ KNOWN_GAMES = {
 
 def get_game_name(title_id: str, product_code: str = "") -> str:
     """Get a human-readable game name from title ID or product code."""
+    if title_id == "ROMFS_FOLDER" or product_code == "RomFS Folder":
+        return "RomFS Folder"
+
     # Pad to 16 chars for lookup
     tid_padded = title_id.upper().replace("0X", "").zfill(16)
 
@@ -67,7 +69,7 @@ def get_game_name(title_id: str, product_code: str = "") -> str:
 
 def scan_rom(filepath: str) -> Dict[str, Any]:
     """
-    Load a ROM file, parse headers, return metadata.
+    Load a ROM file or RomFS folder, parse headers, return metadata.
     Returns a result dict; never raises.
     """
     result = {
@@ -81,9 +83,8 @@ def scan_rom(filepath: str) -> Dict[str, Any]:
     }
 
     try:
-        romfs_data, title_id, product_code, chain = parse_rom(filepath)
-        romfs = RomFSParser(romfs_data)
-        files = romfs.list_files()
+        source, title_id, product_code, chain = load_input_source(filepath)
+        files = source.list_files()
 
         result["success"] = True
         result["title_id"] = title_id

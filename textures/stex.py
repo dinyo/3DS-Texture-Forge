@@ -98,6 +98,9 @@ def parse_stex(data: bytes) -> List[Dict[str, Any]]:
         "height": height,
         "format": pica_fmt,
         "data": pixel_data,
+        "data_offset": data_offset,
+        "data_size": data_size,
+        "stex_format_code": fmt_code,
         "name": name or "stex_texture",
         "mip_count": 1,
     }]

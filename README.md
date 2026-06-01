@@ -48,6 +48,9 @@ No installation needed. Just download and run.
 # Basic extraction
 python main.py extract "game.3ds" -o output_folder
 
+# Extract from an already-unpacked RomFS folder
+python main.py extract "romfs_folder/" -o output_folder
+
 # With deduplication (saves disk space)
 python main.py extract "game.3ds" -o output_folder --dedup
 
@@ -57,9 +60,121 @@ python main.py extract "game.3ds" -o output_folder --report
 # Scan ROM contents without extracting
 python main.py scan "game.3ds" --verbose
 
+# Scan an extracted RomFS folder
+python main.py scan "romfs_folder/" --verbose
+
 # Deep scan (process all files, not just known extensions)
 python main.py extract "game.3ds" --scan-all
+
+# Extract only textures whose parent/source file is .arc
+python main.py extract "romfs_folder/" -o output_folder --only-archive arc
+
+# Extract only BCLIM textures, regardless of parent archive
+python main.py extract "romfs_folder/" -o output_folder --only-texture bclim
+
+# Extract only BCLIM textures inside .arc parents
+python main.py extract "romfs_folder/" -o output_folder --only-archive arc --only-texture bclim
+
+# Extract only textures that build-romfs can currently repack
+python main.py extract "romfs_folder/" -o output_folder --only-supported-writers
+
+# Extract only textures that pass simple RomFS replacement diagnostics
+python main.py extract "romfs_folder/" -o output_folder --skip-unsafe-simple-replace --skip-no-canvas-constraint
+
+# Build a new mod RomFS folder from an extraction manifest
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/"
+
+# Rebuild over an existing mod_romfs folder
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --overwrite
+
+# Re-encode every extracted PNG, including ones unchanged since extraction
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --rebuild-all --overwrite
+
+# Rebuild only .arc-backed textures
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-archive arc --overwrite
+
+# Rebuild only .bclim textures
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-texture bclim --overwrite
+
+# Rebuild only records that have supported texture writers
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-supported-writers --overwrite
+
+# Skip records flagged risky by archive/layout diagnostics
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --skip-unsafe-simple-replace --overwrite
+
+# Skip records that do not have a readable BCLYT pane canvas
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --skip-no-canvas-constraint --overwrite
+
+# Combine the safety filters for a smaller and faster rebuild
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --skip-unsafe-simple-replace --skip-no-canvas-constraint --overwrite
+
+# ETC1/ETC1A4 BCLIM textures are preserved as compressed ETC by default
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-texture bclim --overwrite
+
+# BCLIM/BFLIM replacements write the replacement PNG dimensions into the
+# texture header. When readable BCLYT layout metadata exists, the layout pane
+# keeps the original on-screen canvas.
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-texture bclim --no-preserve-logical-size --overwrite
+
+# Disable the default BCLYT-aware archive behavior while testing
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-texture bclim --no-layout-aware-repack --overwrite
+
+# Use the slower ETC search mode if you want better compression quality
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --only-texture bclim --etc-quality high --overwrite
+
+# Build only one parent archive while testing crashes
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --include-parent "Layout/Title*" --overwrite
+
+# Skip very large replacement payloads while testing memory-sensitive scenes
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --max-texture-bytes 1048576 --overwrite
+
+# Copy the whole source RomFS instead of only manifest-referenced files
+python main.py build-romfs "output_folder/manifest.json" "mod_romfs/" --full-copy --overwrite
 ```
+
+`build-romfs` never overwrites the original RomFS folder. It creates a build
+package with rebuilt files under `mod_romfs/romfs/`, imports replacement PNGs
+where writers are available, and writes a detailed `mod_romfs/report.json`.
+The output path must not overlap the source RomFS path. By default it copies
+only files whose PNGs changed since extraction after filters are applied; use
+`--rebuild-all` to force every PNG through the encoder, or `--full-copy` to
+copy the entire source RomFS.
+For archive BCLIM/BFLIM textures with readable `.bclyt` pane constraints,
+layout-aware repack is enabled by default: the rebuilt texture stores the
+replacement PNG's physical dimensions while BCLYT keeps the logical on-screen
+canvas. Re-extract to refresh `bclan_animation_types` and layout constraint
+metadata before using this on older manifests.
+CTPK rebuild is intentionally conservative: replacements that fit inside the
+original texture data region can be written in place, while replacements that
+would shift later CTPK sections are reported as unsupported instead of producing
+a file with stale internal offsets.
+Extraction manifests use schema v4 with root-level `source`, `extracted_archive`
+(unique extensions/types such as `arc` and `bclim`), `parser_used`, and
+`rebuild_compatibility` fields for rebuild/debugging. Compatibility data is
+kept as compact counts/type summaries so large projects do not bloat the
+manifest with thousands of archive paths.
+For archive-member textures, each `rebuild` block can also include
+`archive_context` and `simple_png_replace_safe`. These flag sibling files such
+as `.bclan`, `.bcmata`, model containers, fonts, and animations that may make a
+simple PNG/BCLIM replacement visually unsafe even when repacking succeeds.
+`.bclyt` is treated as useful layout context, not unsafe by itself. The root
+`simple_replace_risk_summary` aggregates those warnings.
+When a sibling `.bclyt` can be read, records may also include
+`layout_constraints` and `layout_constraint_status`, which show the pane canvas
+that references the texture. This is diagnostic only: runtime game code and
+`.bclan` animations can still resize or override the layout after load.
+
+Current rebuild writers:
+- Texture containers: CTPK, STEX, Shin'en TEX CTR, BFLIM/BCLIM
+- Archives: SARC, NARC, ZAR, GARC, darc
+- Pixel encoding: uncompressed PICA200 formats (RGBA8, RGB8, RGBA5551,
+  RGB565, RGBA4, LA8, HILO8, L8, A8, LA4, L4, A4)
+
+ETC1/ETC1A4 are encoded directly for BCLIM/BFLIM imports, so compressed UI
+textures stay close to their expected size instead of expanding to RGBA8.
+The encoder is conservative and prioritizes size/compatibility over maximum
+visual quality. Parser-only/scan-only containers are reported as unsupported
+instead of being written incorrectly.
 
 ---
 
@@ -71,7 +186,9 @@ Output textures directly in Azahar/Citra custom texture pack format:
 python main.py extract "game.3ds" -o textures/ --output-mode azahar
 ```
 
-This creates files named `tex1_<W>x<H>_<xxhash>_<fmt>.png` in a `<TitleID>/` subdirectory, matching Azahar's expected layout.
+This creates files named `tex1_<W>x<H>_<CityHash64>_<fmt>_mip0.png` plus a `pack.json` in a `<TitleID>/` subdirectory. The `pack.json` is required so Azahar uses the new hash format; without it, Azahar falls back to legacy hashes and dumped filenames will not match.
+
+Runtime dumps are still the safest source of truth for final packs, because Azahar hashes the actual GPU upload bytes. If a static extraction still does not match a dump, use the import flow below.
 
 For manual texture pack building:
 
@@ -153,8 +270,9 @@ Every extraction generates `quality_report.json` and `quality_report.txt` with:
 - NCSD (.3ds cartridge dumps)
 - CIA (.cia installable titles)
 - NCCH, RomFS (internal containers)
+- Extracted RomFS folders
 
-### Archive Formats
+### Extraction Archive Formats
 - SARC / GARC / NARC (Nintendo archives)
 - ZAR / GAR (Grezzo archives - Zelda)
 - darc (Nintendo Data ARChive)
@@ -169,7 +287,7 @@ Every extraction generates `quality_report.json` and `quality_report.txt` with:
 - Smash Bros dt/ls archives
 - Pokemon PC v5/v11 section format
 
-### Texture Formats
+### Extraction Texture Formats
 - All 14 PICA200 GPU formats (RGBA8, RGB8, RGB565, RGBA4, ETC1, ETC1A4, etc.)
 - BCH (Binary CTR H3D textures)
 - CGFX (NintendoWare graphics)
@@ -182,6 +300,34 @@ Every extraction generates `quality_report.json` and `quality_report.txt` with:
 - GDB1 (texture database)
 - IMGC (Level-5)
 - STEX
+
+### Repack / build-romfs Writers
+
+Repacking is intentionally stricter than extraction. The tool only writes formats
+where it has a real archive/container writer and a compatible pixel encoder.
+
+Archive writers:
+- SARC / GARC / NARC
+- ZAR
+- darc
+
+Texture/container writers:
+- BFLIM / BCLIM
+- CTPK
+- CTXB / CMB
+- Shin'en TEX CTR
+- jIMG
+- STEX
+
+Pixel encoders:
+- RGBA8, RGB8, RGBA5551, RGB565, RGBA4
+- LA8, HILO8, L8, A8, LA4, L4, A4
+- ETC1, ETC1A4
+
+Extraction-only for now:
+- GAR, Capcom ARC, Fire Emblem ARC, CPK, ARC0/XFSA, Level-5 flat, GFAC,
+  gzip-CTPK, Smash dt/ls, Pokemon PC sections
+- BCH, CGFX/BCMDL, Capcom TEX, GDB1, IMGC
 
 ### Compression
 - Nintendo LZ10/LZ11/LZ13
@@ -207,7 +353,7 @@ Every extraction generates `quality_report.json` and `quality_report.txt` with:
 
 ## Requirements
 
-- A decrypted 3DS ROM file (.3ds or .cia)
+- A decrypted 3DS ROM file (.3ds or .cia) or an extracted RomFS folder
 - **Windows**: Download .exe from Releases (no setup needed)
 - **Linux/Mac**: Python 3.10+ (see below)
 
@@ -250,7 +396,7 @@ python gui_entry.py        # GUI
 ## Building from Source (Windows)
 
 ```
-pip install PySide6 Pillow numpy xxhash
+pip install PySide6 Pillow numpy
 python gui_entry.py                             # Run GUI
 python main.py extract game.3ds -o output/     # Run CLI
 ```
